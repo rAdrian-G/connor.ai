@@ -4,145 +4,124 @@ import sounddevice as sd
 import pyttsx3
 import ollama
 import threading
-
 from vosk import Model, KaldiRecognizer
 
 # =========================
-# VOZ
+# CONFIG GERAL
 # =========================
+q = queue.Queue()
+falando = False
+lock_fala = threading.Lock()
 
+# =========================
+# VOZ (TTS)
+# =========================
 engine = pyttsx3.init()
 
-falando = False
-ativo = False
-
 voices = engine.getProperty('voices')
-
-# muda voz (teste índices diferentes)
 engine.setProperty('voice', voices[0].id)
-
-# velocidade
 engine.setProperty('rate', 175)
 
-
 def limpar_fila_audio():
-
-    while not q.empty():
-        q.get()
-
-def falar_thread(texto):
-
-    global falando
-
-    falando = True
-
-    print("Atlas:", texto)
-
-    engine.say(texto)
-    engine.runAndWait()
-
-    limpar_fila_audio()
-
-    falando = False
+    try:
+        while True:
+            q.get_nowait()
+    except queue.Empty:
+        pass
 
 def falar(texto):
+    def _falar():
+        global falando
+        with lock_fala:
+            falando = True
+            print("Atlas:", texto)
+            engine.say(texto)
+            engine.runAndWait()
+            limpar_fila_audio()
+            falando = False
 
-    global falando
-
-    if falando:
-        return
-
-    t = threading.Thread(
-        target=falar_thread,
-        args=(texto,)
-    )
-
-    t.daemon = True
-    t.start()
+    threading.Thread(target=_falar, daemon=True).start()
 
 # =========================
-# IA
+# IA (OLLAMA)
 # =========================
-
 def perguntar_ia(pergunta):
-    print("Pergunta enviada:", pergunta)   
-    resposta = ollama.chat(
-        model='llama3',
-        messages=[
-            {
-                'role': 'system',
-                'content': '''
-Você é Atlas.
+    try:
+        resposta = ollama.chat(
+            model="llama3",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Você é Atlas, um assistente rápido, amigável e direto. Responda curto."
+                },
+                {
+                    "role": "user",
+                    "content": pergunta
+                }
+            ]
+        )
+        return resposta["message"]["content"]
+    except Exception as e:
+        return "Deu erro ao falar com a IA."
 
-Um assistente inteligente, amigável e descontraído.
-Responda sempre de forma curta e natural.
-'''
-            },
-            {
-                'role': 'user',
-                'content': pergunta
-            }
-        ]
-    )
-    resposta_texto = resposta['message']['content']
-
-    print("Resposta IA:", resposta_texto)
-    return resposta['message']['content']
+def processar_pergunta(pergunta):
+    resposta = perguntar_ia(pergunta)
+    falar(resposta)
 
 # =========================
-# VOSK
+# VOSK (STT)
 # =========================
-
 model = Model("vosk-model-small-pt-0.3")
 recognizer = KaldiRecognizer(model, 16000)
-
-q = queue.Queue()
 
 def callback(indata, frames, time, status):
     q.put(bytes(indata))
 
 # =========================
-# MICROFONE
+# LOOP PRINCIPAL
 # =========================
+def iniciar_assistente():
+    print("🎙️ Atlas iniciado. Fale 'Atlas' para ativar.")
 
-with sd.RawInputStream(
-    samplerate=16000,
-    blocksize=8000,
-    dtype='int16',
-    channels=1,
-    callback=callback
-):
+    with sd.RawInputStream(
+        samplerate=16000,
+        blocksize=8000,
+        dtype="int16",
+        channels=1,
+        callback=callback
+    ):
+        while True:
+            data = q.get()
 
-    print("Atlas ouvindo...")
+            if recognizer.AcceptWaveform(data):
+                resultado = json.loads(recognizer.Result())
+                texto = resultado.get("text", "").lower().strip()
 
-    while True:
-
-        data = q.get()
-
-        if recognizer.AcceptWaveform(data):
-
-            resultado = json.loads(recognizer.Result())
-
-            texto = resultado.get("text", "").lower().strip()
-
-            if texto == "":
-                continue
-
-            print("Você:", texto)
-
-            # evita ouvir a própria voz
-            if falando:
-                continue
-
-            # ativação
-            if "atlas" in texto:
-
-                pergunta = texto.replace("atlas", "").strip()
-
-                if pergunta == "":
-                    falar("Sim?")
+                if not texto:
                     continue
 
-                resposta = perguntar_ia(pergunta)
-                print("Atlas:", resposta)
-                falar(resposta)
+                # Evita eco
+                if falando:
+                    continue
+
+                print("Você:", texto)
+
+                # Wake word
+                if "atlas" in texto:
+                    pergunta = texto.replace("atlas", "").strip()
+
+                    if not pergunta:
+                        falar("Sim?")
+                        continue
+
+                    # NÃO bloqueia o sistema
+                    threading.Thread(
+                        target=processar_pergunta,
+                        args=(pergunta,),
+                        daemon=True
+                    ).start()
+
+# =========================
+# START
+# =========================
+iniciar_assistente()
