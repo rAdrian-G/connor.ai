@@ -11,6 +11,7 @@ from vosk import Model, KaldiRecognizer
 # =========================
 q = queue.Queue()
 falando = False
+aguardando_pergunta = False
 lock_fala = threading.Lock()
 
 # =========================
@@ -37,7 +38,6 @@ def falar(texto):
             print("Atlas:", texto)
             engine.say(texto)
             engine.runAndWait()
-            limpar_fila_audio()
             falando = False
 
     threading.Thread(target=_falar, daemon=True).start()
@@ -47,6 +47,7 @@ def falar(texto):
 # =========================
 def perguntar_ia(pergunta):
     try:
+        print("Perguntando IA:", pergunta)
         resposta = ollama.chat(
             model="llama3",
             messages=[
@@ -60,12 +61,37 @@ def perguntar_ia(pergunta):
                 }
             ]
         )
-        return resposta["message"]["content"]
+        print("Resposta crua da IA:", resposta)
+        # Tentar extrair conteúdo de várias formas possíveis
+        # 1) objeto com atributo `message` (SDK Ollama)
+        if hasattr(resposta, "message"):
+            msg = getattr(resposta, "message")
+            if hasattr(msg, "content"):
+                return getattr(msg, "content")
+            if isinstance(msg, dict) and "content" in msg:
+                return msg["content"]
+
+        # 2) dicionário com chave message/content
+        if isinstance(resposta, dict):
+            if "message" in resposta and isinstance(resposta["message"], dict) and "content" in resposta["message"]:
+                return resposta["message"]["content"]
+            if "content" in resposta:
+                return resposta["content"]
+
+        # 3) objeto/struct com `content` direto
+        if hasattr(resposta, "content"):
+            return getattr(resposta, "content")
+
+        # fallback: string
+        return str(resposta)
     except Exception as e:
+        print("Erro ao chamar IA:", repr(e))
         return "Deu erro ao falar com a IA."
 
 def processar_pergunta(pergunta):
+    print("Processando pergunta:", pergunta)
     resposta = perguntar_ia(pergunta)
+    print("Resposta final para falar:", resposta)
     falar(resposta)
 
 # =========================
@@ -81,7 +107,8 @@ def callback(indata, frames, time, status):
 # LOOP PRINCIPAL
 # =========================
 def iniciar_assistente():
-    print("🎙️ Atlas iniciado. Fale 'Atlas' para ativar.")
+    global aguardando_pergunta
+    print("🎙️ Atlas iniciado. Fale 'ativar' para ativar.")
 
     with sd.RawInputStream(
         samplerate=16000,
@@ -100,26 +127,47 @@ def iniciar_assistente():
                 if not texto:
                     continue
 
-                # Evita eco
+                # Evita eco e descarta áudio enquanto Atlas fala
                 if falando:
+                    limpar_fila_audio()
+                    continue
+
+                if aguardando_pergunta:
+                    print("Você:", texto)
+                    aguardando_pergunta = False
+                    threading.Thread(
+                        target=processar_pergunta,
+                        args=(texto,),
+                        daemon=True
+                    ).start()
                     continue
 
                 print("Você:", texto)
 
                 # Wake word
-                if "atlas" in texto:
-                    pergunta = texto.replace("atlas", "").strip()
+                if "ativar" in texto or "atlas" in texto:
+                    pergunta = texto
+                    pergunta = pergunta.replace("ativar", "")
+                    pergunta = pergunta.replace("atlas", "").strip()
 
                     if not pergunta:
+                        aguardando_pergunta = True
                         falar("Sim?")
                         continue
 
-                    # NÃO bloqueia o sistema
                     threading.Thread(
                         target=processar_pergunta,
                         args=(pergunta,),
                         daemon=True
                     ).start()
+                else:
+                    pergunta = texto
+                    threading.Thread(
+                        target=processar_pergunta,
+                        args=(pergunta,),
+                        daemon=True
+                    ).start()
+
 
 # =========================
 # START
